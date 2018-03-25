@@ -1,0 +1,260 @@
+#!/usr/bin/perl
+
+my $details =<<DETAILS
+AUTHOR:    Richard James Howe
+DATE:      25/03/2018
+CONTACT:   howe.r.j.89\@gmail.com
+DETAILS
+;
+
+# Hacked together fuzzy searching program using Levenshtein edit distance
+#
+# TODO: string ignore/replacing options, optional case folding, documentation,
+# algorithm tweaking options, getopts, etcetera
+#
+# Different algorithms could be used, like SOUNDEX, see:
+# <https://en.wikipedia.org/wiki/Soundex>
+# <https://medium.com/@mrpowers/fuzzy-matching-in-spark-with-soundex-and-levenshtein-distance-6749f5af8f28>
+#
+# <http://search.cpan.org/dist/Text-Levenshtein/lib/Text/Levenshtein.pm>
+# <https://www.perlmonks.org/?node=Levenshtein%20distance%3A%20calculating%20similarity%20of%20strings>
+# <https://www.perlmonks.org/?node=String%3A%3AApprox>
+# <http://search.cpan.org/dist/String-Approx/Approx.pm>
+# <https://en.wikipedia.org/wiki/Edit_distance>
+# <https://en.wikipedia.org/wiki/Wagner%E2%80%93Fischer_algorithm>
+# <https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance>
+#
+# Some kind of similarity index could be made, perhaps:
+# 	levenshtein(a, b) / (length(a) + length(b))
+# Or:
+# 	1 - (levenshtein(a, b) / $max_distance)
+# Or something that takes into account the relative lengths of the strings?
+#
+# Sorting might best be made to be optional, so this turns into more of a 
+# traditional Unix filter like program. Alternatively an output of edit 
+# distances scaled by the largest edit distance and sorted from most to least 
+# similar could be more useful for accepting further processing with a cutoff 
+# like mechanism.
+#
+# Other algorithms could give more weight to certain things, like the longest 
+# matching substrings, or shared English words as substrings, or other metrics.
+#
+
+use strict;
+use warnings;
+use Getopt::Long;
+# use Text::Levenshtein qw(distance);
+
+my $ofs = ",";
+
+sub slurp_file($)
+{
+	my $fh = $_[0];
+	my @lines = ();
+	while(<$fh>) {
+		chomp;
+		push @lines, $_;
+	}
+	\@lines;
+}
+
+# Open up a file for reading, and read each line into an array, returning an
+# array reference containing all the lines in a file.
+sub slurp($) {
+	my $file = $_[0];
+	open (my $fh, "<", $file) or die "cannot open '$file' for reading: $!\n";
+	my $r = &slurp_file($fh);
+	close $fh;
+	$r;
+}
+
+# Calculate the Levenshtein distance between two strings, returning
+# a numeric result.
+sub levenshtein($$) { # https://rosettacode.org/wiki/Levenshtein_distance#Perl
+	my ($s, $t) = @_;
+
+	sub min { # return minimum of all arguments
+		my $r = shift;
+		foreach my $i (@_) {
+			$r = $i if $i < $r;
+		}
+		$r;
+	}
+ 
+	my $tl = length $t;
+	my $sl = length $s;
+ 
+	my @d = ([0 .. $tl], map { [$_] } 1 .. $sl);
+ 
+	foreach my $i (0 .. $sl - 1) {
+		foreach my $j (0 .. $tl - 1) {
+			$d[$i + 1][$j + 1] = substr($s, $i, 1) eq substr($t, $j, 1)
+			  ? $d[$i][$j]
+			  : 1 + min($d[$i][$j + 1], $d[$i + 1][$j], $d[$i][$j]);
+		}
+	}
+ 
+	$d[-1][-1];
+}
+
+# Given two references to an array, with a one to one correspondence between the
+# values, this function sorts the first array numerically whilst updating the
+# second to keep the same correspondence. Optionally the order may be reversed.
+# See: <http://www.perlmonks.org/?node_id=878679>
+sub dsort($$;$) {
+	my @a       = @{$_[0]};
+	my @b       = @{$_[1]};
+	my $reverse = $_[2];
+
+	$reverse = 0 unless(defined($reverse));
+
+	die "unequal array lengths: $#a, $#b\n" if $#a != $#b;
+
+	my @index = 0..$#a;
+
+	@index = sort { $reverse ? $a[$b] <=> $a[$a] :  $a[$a] <=> $a[$b] } @index;
+
+	my @sorted_a = @a[@index];
+	my @sorted_b = @b[@index];
+	(\@sorted_a, \@sorted_b)
+}
+
+my $instructions =<<HELP
+Levenshtein Distance/Fuzzy String Matching utility. This utility takes a string
+to compare against, and expects a list of strings to perform fuzzy matching
+against, one per line. It returns a sorted list of the provided strings with
+an edit distance affixed, with '$ofs' as the seperator, the closest matches are 
+provided first, which are the ones with the lowest edit distance. 
+
+There are options are to ignore case, and also to provide a list of 
+substitutions to apply, which allows for looser matching if needed.
+
+The substitution list is provided with the '-s' option, and consists of
+a series of tab delimited match-replace pairs. The first element when matches
+is replaced with the second element, case insensitivity is applied if the
+ignore case ('-i') option is supplied. The substitutions are applied in order
+of appearance.
+
+As an example:
+
+a	b
+cd	
+
+This would replace any 'a' occuring in the strings to match with 'b' and
+remove all occurances of 'cd' (the second record, the replace string, defaults
+to the empty string).
+
+
+$details
+
+Usage:
+	
+	fuzzy.pl string file?
+
+Options:
+
+	-i, --ignore-case
+	-s, --substitute-file file.txt
+	-r, --reverse-sort
+	-S, --scale
+	-h, --help
+
+HELP
+;
+
+sub help() {
+	print STDERR $instructions;
+	exit
+}
+
+# TODO: Option for no sorting
+my $substitute = undef;
+my $caseless   = 0;
+my $reverse    = 0;
+my $scale      = 0;
+GetOptions(
+	"i|ignore-case"       => \$caseless,
+	"s|substitute-file=s" => \$substitute,
+	"r|reverse-sort"      => \$reverse,
+	"scale"               => \$scale,
+	"h|help"              => \&help,
+	) or die "invalid command line options\n";
+
+my $argc = $#ARGV + 1;
+&help if $argc < 1;
+
+my $fuzz       = $caseless ? lc $ARGV[0] : $ARGV[0];
+my $dict       = $ARGV[1]; # If 'undef' use stdin
+my @lines      = defined $dict ? @{slurp($dict)} : @{slurp_file(*STDIN)};
+my @candidates = $caseless ? map lc, @lines : @lines;
+
+# Parse TAB delimited table of match/replace pairs, 
+# replace defaults to empty string.
+#
+# TODO: Allow escaping of tabs, and checking for errors, there
+# should only be two records per line
+sub load_substitutions($;$) {
+	my ($substitute, $caseless) = @_;
+	my @subs     = @{slurp($substitute)};
+	@subs        = map lc, @subs if((defined $caseless) and $caseless);
+	my @matches  = ();
+	my @replaces = ();
+
+	for(my $i = 0; $i <= $#subs; $i++) {
+		my @s         = split /\t/, $subs[$i];
+		my $match     = $s[0];
+		my $replace   = "";
+		$replace      = $s[1] if(defined $s[1]);
+		$matches[$i]  = $match;
+		$replaces[$i] = $replace;
+	}
+
+	(\@matches, \@replaces);
+}
+
+sub apply_substitutions($$)
+{
+	my ($value, @matches, @replaces) = ($_[0], @{$_[1][0]}, @{$_[1][0]});
+	for(my $j = 0; $j <= $#matches; $j++) {
+		my ($s, $r) = ($matches[$j], $replaces[$j]);
+		$value =~ s/$s/$r/g;
+	}
+	$value;
+}
+
+
+# TODO: Apply the substitutions to the string to match
+sub substitutions($$;$) {
+	my @candidates = @{$_[0]};
+	my $substitute = $_[1];
+	my $caseless   = $_[2];
+	return \@candidates if not defined $substitute;
+
+	my @subs = &load_substitutions($substitute, $caseless);
+	my @matches  = @{$subs[0]};
+	my @replaces = @{$subs[1]};
+
+	for(my $i = 0; $i <= $#candidates; $i++) {
+		for(my $j = 0; $j <= $#matches; $j++) {
+			my ($s, $r) = ($matches[$j], $replaces[$j]);
+			$candidates[$i] =~ s/$s/$r/g;
+		}
+	}
+
+	\@candidates;
+}
+
+@candidates   = @{&substitutions(\@candidates, $substitute, $caseless)};
+my @distances = map { &levenshtein($fuzz, $_) } @candidates;
+my ($ar, $br) = dsort(\@distances, \@lines, $reverse);
+my @a = @{$ar};
+my @b = @{$br};
+my ($min, $max) = ($a[0], $a[-1]);
+
+# Print results
+for(my $i = 0; $i <= $#a; $i++) {
+	my ($d, $l) = ($a[$i], $b[$i]);
+	$d = (1.0 - ($d / $max)) if $scale;
+	print "$d$ofs$l\n";
+}
+
